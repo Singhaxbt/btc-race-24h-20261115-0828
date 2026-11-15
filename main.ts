@@ -52,6 +52,24 @@ const closes: bigint[] = [];
 /** Highest close since the current position was opened, null when flat. */
 let peak: bigint | null = null;
 
+/**
+ * Whether the position should be exited whole at this close: take-profit,
+ * stop-loss, or the trailing stop under the highest close since entry.
+ * Any one of the three is enough; the caller re-sends the sell while the
+ * position is still there, so a rejected fill is retried next batch.
+ */
+function shouldExit(value: bigint, cost: bigint, peakClose: bigint | null, close: bigint): boolean {
+  const takeProfit = value >= (cost * BigInt(10000 + TP_BPS)) / 10000n;
+  const stopLoss = value <= (cost * BigInt(10000 - SL_BPS)) / 10000n;
+  const trailing = peakClose !== null && close * 10000n <= peakClose * BigInt(10000 - TRAIL_BPS);
+  return takeProfit || stopLoss || trailing;
+}
+
+/** Whether this close is a confirmed breakout above the lookback high. */
+function isBreakout(close: bigint, high: bigint): boolean {
+  return close * 10000n > high * BigInt(10000 + MARGIN_BPS);
+}
+
 await runBars({
   onBatch(state: BarsState, batch: Batch) {
     const bar = batch.bars.find((b) => b.symbol === SYMBOL);
@@ -67,10 +85,7 @@ await runBars({
       if (peak === null || close > peak) peak = close;
       const value = state.value(SYMBOL, held.qty);
       const cost = held.cost;
-      const takeProfit = value >= (cost * BigInt(10000 + TP_BPS)) / 10000n;
-      const stopLoss = value <= (cost * BigInt(10000 - SL_BPS)) / 10000n;
-      const trailing = peak !== null && close * 10000n <= peak * BigInt(10000 - TRAIL_BPS);
-      if (takeProfit || stopLoss || trailing) {
+      if (shouldExit(value, cost, peak, close)) {
         orders.push({ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
         peak = null;
       }
@@ -79,7 +94,7 @@ await runBars({
       for (let k = closes.length - LOOKBACK; k < closes.length; k++) {
         if (closes[k] > high) high = closes[k];
       }
-      if (close * 10000n > high * BigInt(10000 + MARGIN_BPS)) {
+      if (isBreakout(close, high)) {
         const notional = (state.cash * SIZE_NUM) / SIZE_DEN;
         if (notional >= BigInt(state.hello.fees.min_notional_quote_units)) {
           orders.push({ side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS });
